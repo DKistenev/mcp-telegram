@@ -138,10 +138,7 @@ async def list_messages(
         if not isinstance(result, types.messages.PeerDialogs):
             raise TypeError(f"Unexpected result: {type(result)}")
 
-        for dialog in result.dialogs:
-            logger.debug("dialog: %s", dialog)
-        for message in result.messages:
-            logger.debug("message: %s", message)
+        dialog = result.dialogs[-1]
 
         iter_messages_args: dict[str, t.Any] = {
             "entity": args.dialog_id,

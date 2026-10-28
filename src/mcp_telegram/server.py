@@ -20,7 +20,7 @@ from mcp.types import (
 
 from . import tools
 
-logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger(__name__)
 app = Server("mcp-telegram")
 
