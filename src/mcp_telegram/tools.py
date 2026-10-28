@@ -1,3 +1,4 @@
+# ruff: noqa: CPY001, RUF001
 from __future__ import annotations
 
 import logging
@@ -12,7 +13,7 @@ from mcp.types import (
     Tool,
 )
 from pydantic import BaseModel, ConfigDict
-from telethon import TelegramClient, custom, functions, types  # type: ignore[import-untyped]
+from telethon import TelegramClient, custom, functions, types, utils  # type: ignore[import-untyped]
 
 from .telegram import create_client
 
@@ -110,6 +111,10 @@ class ListMessages(ToolArgs):
 
     If `limit` is set, only the last `limit` messages will be listed. If `unread` is set, the limit will be
     the minimum between the unread messages and the limit.
+
+    Each message is returned as `[YYYY-MM-DD HH:MM] <author>: <text>`, where the author is `Я` for
+    messages sent by the account owner. Media is marked in brackets, e.g. `[фото]` or
+    `[файл: report.pdf, 2 МБ]`.
     """
 
     dialog_id: int
@@ -150,8 +155,75 @@ async def list_messages(
         logger.debug("iter_messages_args: %s", iter_messages_args)
         async for message in client.iter_messages(**iter_messages_args):
             logger.debug("message: %s", type(message))
-            if isinstance(message, custom.Message) and message.text:
-                logger.debug("message: %s", message.text)
-                response.append(TextContent(type="text", text=message.text))
+            if not isinstance(message, custom.Message) or message.action:
+                continue
+            body = " ".join(part for part in (media_label(message), message.text) if part)
+            if body:
+                response.append(TextContent(type="text", text=f"{message_header(message)}: {body}"))
 
     return response
+
+
+def display_name(entity: t.Any) -> str:  # noqa: ANN401
+    if entity is None:
+        return ""
+    name = utils.get_display_name(entity)
+    username = getattr(entity, "username", None)
+    return f"{name} (@{username})" if username else name
+
+
+def message_header(message: custom.Message) -> str:
+    date = message.date.astimezone().strftime("%Y-%m-%d %H:%M")
+    is_me = message.out or getattr(message.sender, "is_self", False)
+    author = "Я" if is_me else (display_name(message.sender) or message.post_author or "?")
+    header = f"[{date}] {author}"
+    if message.forward:
+        origin = message.forward.from_name or display_name(message.forward.sender or message.forward.chat)
+        header += f" (переслано от {origin or '?'})"
+    return header
+
+
+def human_size(size: int | None) -> str:
+    if not size:
+        return ""
+    value = float(size)
+    for unit in ("Б", "КБ", "МБ"):
+        if value < 1024:  # noqa: PLR2004
+            return f"{value:.0f} {unit}"
+        value /= 1024
+    return f"{value:.1f} ГБ"
+
+
+def media_label(message: custom.Message) -> str:  # noqa: C901, PLR0911
+    if isinstance(message.media, types.MessageMediaWebPage):
+        return ""  # link preview, the link itself is in the text
+    file = message.file
+    if message.photo:
+        return "[фото]"
+    if message.sticker:
+        return f"[стикер {file.emoji}]" if file and file.emoji else "[стикер]"
+    if message.voice:
+        return f"[голосовое, {file.duration} с]" if file and file.duration else "[голосовое]"
+    if message.video_note:
+        return "[видеокружок]"
+    if message.gif:
+        return "[GIF]"
+    if message.audio:
+        track = " — ".join(part for part in (file.performer, file.title) if part) or file.name
+        return f"[аудио: {track}]" if track else "[аудио]"
+    if message.video:
+        return f"[видео: {file.name}]" if file.name else "[видео]"
+    if message.document:
+        details = ", ".join(part for part in (file.name, human_size(file.size)) if part)
+        return f"[файл: {details}]" if details else "[файл]"
+    if message.contact:
+        contact = message.contact
+        return f"[контакт: {' '.join(p for p in (contact.first_name, contact.last_name) if p)}]"
+    if message.geo:
+        return "[геопозиция]"
+    if message.poll:
+        question = message.poll.poll.question
+        return f"[опрос: {getattr(question, 'text', question)}]"
+    if message.media:
+        return "[медиа]"
+    return ""
