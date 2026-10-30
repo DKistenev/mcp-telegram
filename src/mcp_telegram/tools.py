@@ -1,9 +1,11 @@
 # ruff: noqa: CPY001, RUF001
 from __future__ import annotations
 
+import json
 import logging
 import sys
 import typing as t
+from datetime import datetime
 from functools import singledispatch
 
 from mcp.types import (
@@ -12,7 +14,7 @@ from mcp.types import (
     TextContent,
     Tool,
 )
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 from telethon import TelegramClient, custom, functions, types, utils  # type: ignore[import-untyped]
 
 from .telegram import create_client
@@ -70,11 +72,28 @@ def tool_args(tool: Tool, *args, **kwargs) -> ToolArgs:  # noqa: ANN002, ANN003
 
 
 class ListDialogs(ToolArgs):
-    """List available dialogs, chats and channels."""
+    """
+    List dialogs (private chats, groups, channels), most recent first.
 
+    Returns one JSON object per line: id, name, type (user, bot, group, supergroup, channel),
+    username, unread, mentions. Use `query` to find a dialog by name or @username instead of
+    listing everything. If more results are available, the last line is `{"next_offset": N}`.
+    """
+
+    query: str | None = Field(None, description="Case-insensitive substring of the dialog name or @username")
     unread: bool = False
     archived: bool = False
     ignore_pinned: bool = False
+    limit: int = Field(50, description="Maximum number of dialogs to return")
+    offset: int = Field(0, description="Number of matching dialogs to skip, for paging")
+
+
+def dialog_type(dialog: custom.dialog.Dialog) -> str:
+    if dialog.is_user:
+        return "bot" if getattr(dialog.entity, "bot", False) else "user"
+    if dialog.is_channel:
+        return "supergroup" if getattr(dialog.entity, "megagroup", False) else "channel"
+    return "group"
 
 
 @tool_runner.register
@@ -84,19 +103,37 @@ async def list_dialogs(
     client: TelegramClient
     logger.info("method[ListDialogs] args[%s]", args)
 
-    response: list[TextContent] = []
+    query = (args.query or "").lstrip("@").casefold()
+    lines: list[str] = []
+    matched = 0
     async with create_client() as client:
         dialog: custom.dialog.Dialog
         async for dialog in client.iter_dialogs(archived=args.archived, ignore_pinned=args.ignore_pinned):
             if args.unread and dialog.unread_count == 0:
                 continue
-            msg = (
-                f"name='{dialog.name}' id={dialog.id} "
-                f"unread={dialog.unread_count} mentions={dialog.unread_mentions_count}"
+            username = getattr(dialog.entity, "username", None)
+            if query and query not in f"{dialog.name}\n{username or ''}".casefold():
+                continue
+            matched += 1
+            if matched <= args.offset:
+                continue
+            if len(lines) == args.limit:
+                lines.append(json_line({"next_offset": args.offset + args.limit}))
+                break
+            lines.append(
+                json_line(
+                    {
+                        "id": dialog.id,
+                        "name": dialog.name,
+                        "type": dialog_type(dialog),
+                        "username": username,
+                        "unread": dialog.unread_count,
+                        "mentions": dialog.unread_mentions_count,
+                    }
+                )
             )
-            response.append(TextContent(type="text", text=msg))
 
-    return response
+    return [TextContent(type="text", text="\n".join(lines) or "No dialogs found")]
 
 
 ### ListMessages ###
@@ -104,22 +141,23 @@ async def list_dialogs(
 
 class ListMessages(ToolArgs):
     """
-    List messages in a given dialog, chat or channel. The messages are listed in order from newest to oldest.
+    List messages in a dialog, chat or channel, newest first.
 
-    If `unread` is set to `True`, only unread messages will be listed. Once a message is read, it will not be
-    listed again.
+    Returns one JSON object per line: id, date (local time), from (`Я` for the account owner),
+    out, reply_to (id of the replied message), forwarded_from, media (e.g. `фото`,
+    `файл: report.pdf, 2 МБ`) and text. Fields that are empty are omitted.
 
-    If `limit` is set, only the last `limit` messages will be listed. If `unread` is set, the limit will be
-    the minimum between the unread messages and the limit.
-
-    Each message is returned as `[YYYY-MM-DD HH:MM] <author>: <text>`, where the author is `Я` for
-    messages sent by the account owner. Media is marked in brackets, e.g. `[фото]` or
-    `[файл: report.pdf, 2 МБ]`.
+    To page back through history, pass the id from the last line `{"next_offset_id": N}` as
+    `offset_id`, or use `offset_date` to start from a given date. If `unread` is set, only unread
+    messages are listed, up to `limit`.
     """
 
     dialog_id: int
     unread: bool = False
-    limit: int = 100
+    limit: int = Field(100, description="Maximum number of messages to return")
+    offset_id: int | None = Field(None, description="Only return messages older than this message id")
+    offset_date: str | None = Field(None, description="Only return messages older than this date, ISO 8601")
+    search: str | None = Field(None, description="Only return messages containing this text")
 
 
 @tool_runner.register
@@ -129,7 +167,7 @@ async def list_messages(
     client: TelegramClient
     logger.info("method[ListMessages] args[%s]", args)
 
-    response: list[TextContent] = []
+    lines: list[str] = []
     async with create_client() as client:
         result = await client(functions.messages.GetPeerDialogsRequest(peers=[args.dialog_id]))
         if not result:
@@ -143,22 +181,31 @@ async def list_messages(
         iter_messages_args: dict[str, t.Any] = {
             "entity": args.dialog_id,
             "reverse": False,
+            "limit": min(dialog.unread_count, args.limit) if args.unread else args.limit,
+            "offset_id": args.offset_id or 0,
+            "offset_date": datetime.fromisoformat(args.offset_date) if args.offset_date else None,
+            "search": args.search,
         }
-        if args.unread:
-            iter_messages_args["limit"] = min(dialog.unread_count, args.limit)
-        else:
-            iter_messages_args["limit"] = args.limit
 
         logger.debug("iter_messages_args: %s", iter_messages_args)
+        last_id = None
+        count = 0
         async for message in client.iter_messages(**iter_messages_args):
-            logger.debug("message: %s", type(message))
+            count += 1
+            last_id = message.id
             if not isinstance(message, custom.Message) or message.action:
                 continue
-            body = " ".join(part for part in (media_label(message), message.text) if part)
-            if body:
-                response.append(TextContent(type="text", text=f"{message_header(message)}: {body}"))
+            record = message_record(message)
+            if "media" in record or "text" in record:
+                lines.append(json_line(record))
+        if last_id is not None and count == iter_messages_args["limit"]:
+            lines.append(json_line({"next_offset_id": last_id}))
 
-    return response
+    return [TextContent(type="text", text="\n".join(lines) or "No messages found")]
+
+
+def json_line(record: dict[str, t.Any]) -> str:
+    return json.dumps({k: v for k, v in record.items() if v is not None and v != ""}, ensure_ascii=False)
 
 
 def display_name(entity: t.Any) -> str:  # noqa: ANN401
@@ -169,15 +216,23 @@ def display_name(entity: t.Any) -> str:  # noqa: ANN401
     return f"{name} (@{username})" if username else name
 
 
-def message_header(message: custom.Message) -> str:
-    date = message.date.astimezone().strftime("%Y-%m-%d %H:%M")
+def message_record(message: custom.Message) -> dict[str, t.Any]:
     is_me = message.out or getattr(message.sender, "is_self", False)
-    author = "Я" if is_me else (display_name(message.sender) or message.post_author or "?")
-    header = f"[{date}] {author}"
+    forwarded_from = None
     if message.forward:
-        origin = message.forward.from_name or display_name(message.forward.sender or message.forward.chat)
-        header += f" (переслано от {origin or '?'})"
-    return header
+        forward = message.forward
+        forwarded_from = forward.from_name or display_name(forward.sender or forward.chat) or "?"
+    label = media_label(message)
+    return {
+        "id": message.id,
+        "date": message.date.astimezone().strftime("%Y-%m-%d %H:%M"),
+        "from": "Я" if is_me else (display_name(message.sender) or message.post_author or "?"),
+        "out": bool(is_me),
+        "reply_to": message.reply_to_msg_id,
+        "forwarded_from": forwarded_from,
+        "media": label[1:-1] if label else None,
+        "text": message.text,
+    }
 
 
 def human_size(size: int | None) -> str:
