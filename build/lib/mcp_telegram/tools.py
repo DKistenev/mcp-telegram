@@ -146,6 +146,7 @@ class ListMessages(ToolArgs):
     Returns one JSON object per line: id, date (local time), from (`Я` for the account owner),
     out, reply_to (id of the replied message), forwarded_from, media (e.g. `фото`,
     `файл: report.pdf, 2 МБ`) and text. Fields that are empty are omitted.
+    Use GetMessages to fetch a `reply_to` target that is not in the listed page.
 
     To page back through history, pass the id from the last line `{"next_offset_id": N}` as
     `offset_id`, or use `offset_date` to start from a given date. If `unread` is set, only unread
