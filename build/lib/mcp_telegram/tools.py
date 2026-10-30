@@ -204,6 +204,45 @@ async def list_messages(
     return [TextContent(type="text", text="\n".join(lines) or "No messages found")]
 
 
+### GetMessages ###
+
+
+class GetMessages(ToolArgs):
+    """
+    Get specific messages of a dialog by id, e.g. the message a `reply_to` points at.
+
+    Returns one JSON object per line in the same format as ListMessages. An id that does not
+    exist or was deleted is returned as `{"id": N, "missing": true}`.
+    """
+
+    dialog_id: int
+    ids: list[int] = Field(description="Message ids to fetch, at most 100")
+
+
+@tool_runner.register
+async def get_messages(
+    args: GetMessages,
+) -> t.Sequence[TextContent | ImageContent | EmbeddedResource]:
+    client: TelegramClient
+    logger.info("method[GetMessages] args[%s]", args)
+
+    if len(args.ids) > 100:  # noqa: PLR2004
+        raise ValueError("At most 100 ids per call")
+
+    lines: list[str] = []
+    async with create_client() as client:
+        found = {
+            message.id: message
+            for message in await client.get_messages(args.dialog_id, ids=args.ids)
+            if isinstance(message, custom.Message) and not message.action
+        }
+        for message_id in args.ids:
+            message = found.get(message_id)
+            lines.append(json_line(message_record(message) if message else {"id": message_id, "missing": True}))
+
+    return [TextContent(type="text", text="\n".join(lines))]
+
+
 def json_line(record: dict[str, t.Any]) -> str:
     return json.dumps({k: v for k, v in record.items() if v is not None and v != ""}, ensure_ascii=False)
 

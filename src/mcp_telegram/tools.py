@@ -146,6 +146,7 @@ class ListMessages(ToolArgs):
     Returns one JSON object per line: id, date (local time), from (`Я` for the account owner),
     out, reply_to (id of the replied message), forwarded_from, media (e.g. `фото`,
     `файл: report.pdf, 2 МБ`) and text. Fields that are empty are omitted.
+    Use GetMessages to fetch a `reply_to` target that is not in the listed page.
 
     To page back through history, pass the id from the last line `{"next_offset_id": N}` as
     `offset_id`, or use `offset_date` to start from a given date. If `unread` is set, only unread
@@ -202,6 +203,45 @@ async def list_messages(
             lines.append(json_line({"next_offset_id": last_id}))
 
     return [TextContent(type="text", text="\n".join(lines) or "No messages found")]
+
+
+### GetMessages ###
+
+
+class GetMessages(ToolArgs):
+    """
+    Get specific messages of a dialog by id, e.g. the message a `reply_to` points at.
+
+    Returns one JSON object per line in the same format as ListMessages. An id that does not
+    exist or was deleted is returned as `{"id": N, "missing": true}`.
+    """
+
+    dialog_id: int
+    ids: list[int] = Field(description="Message ids to fetch, at most 100")
+
+
+@tool_runner.register
+async def get_messages(
+    args: GetMessages,
+) -> t.Sequence[TextContent | ImageContent | EmbeddedResource]:
+    client: TelegramClient
+    logger.info("method[GetMessages] args[%s]", args)
+
+    if len(args.ids) > 100:  # noqa: PLR2004
+        raise ValueError("At most 100 ids per call")
+
+    lines: list[str] = []
+    async with create_client() as client:
+        found = {
+            message.id: message
+            for message in await client.get_messages(args.dialog_id, ids=args.ids)
+            if isinstance(message, custom.Message) and not message.action
+        }
+        for message_id in args.ids:
+            message = found.get(message_id)
+            lines.append(json_line(message_record(message) if message else {"id": message_id, "missing": True}))
+
+    return [TextContent(type="text", text="\n".join(lines))]
 
 
 def json_line(record: dict[str, t.Any]) -> str:
