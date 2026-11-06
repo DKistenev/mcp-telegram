@@ -71,16 +71,21 @@ def tool_args(tool: Tool, *args, **kwargs) -> ToolArgs:  # noqa: ANN002, ANN003
 ### ListDialogs ###
 
 
+DialogType = t.Literal["user", "bot", "group", "supergroup", "channel"]
+
+
 class ListDialogs(ToolArgs):
     """
     List dialogs (private chats, groups, channels), most recent first.
 
     Returns one JSON object per line: id, name, type (user, bot, group, supergroup, channel),
     username, unread, mentions. Use `query` to find a dialog by name or @username instead of
-    listing everything. If more results are available, the last line is `{"next_offset": N}`.
+    listing everything, and `types` to keep only some kinds, e.g. `["user"]` for private chats.
+    If more results are available, the last line is `{"next_offset": N}`.
     """
 
     query: str | None = Field(None, description="Case-insensitive substring of the dialog name or @username")
+    types: list[DialogType] | None = Field(None, description="Only return dialogs of these types, e.g. [\"user\"]")
     unread: bool = False
     archived: bool = False
     ignore_pinned: bool = False
@@ -111,6 +116,9 @@ async def list_dialogs(
         async for dialog in client.iter_dialogs(archived=args.archived, ignore_pinned=args.ignore_pinned):
             if args.unread and dialog.unread_count == 0:
                 continue
+            kind = dialog_type(dialog)
+            if args.types and kind not in args.types:
+                continue
             username = getattr(dialog.entity, "username", None)
             if query and query not in f"{dialog.name}\n{username or ''}".casefold():
                 continue
@@ -125,7 +133,7 @@ async def list_dialogs(
                     {
                         "id": dialog.id,
                         "name": dialog.name,
-                        "type": dialog_type(dialog),
+                        "type": kind,
                         "username": username,
                         "unread": dialog.unread_count,
                         "mentions": dialog.unread_mentions_count,

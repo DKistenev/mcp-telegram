@@ -28,6 +28,7 @@ Read-only access to the user's Telegram account. Nothing can be sent, edited or 
 - Find a chat with ListDialogs and `query` (name or @username) first. Do not list dialogs without
   a filter: an account can have thousands of them. Page with `offset` from `next_offset`.
 - Tell private chats, bots, groups and channels apart by the `type` field, not by the sign of the id.
+  Filter by it with `types`, e.g. `["user"]` when looking for a person.
 - Read a chat with ListMessages, newest first. Page back with `offset_id` from `next_offset_id`
   or with `offset_date`, and find text inside one chat with `search`.
 - When `reply_to` points at a message that is not in the page, fetch it with GetMessages.
