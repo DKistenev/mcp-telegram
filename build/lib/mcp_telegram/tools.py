@@ -3,10 +3,12 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sys
 import typing as t
 from datetime import datetime
 from functools import singledispatch
+from pathlib import Path
 
 from mcp.types import (
     EmbeddedResource,
@@ -85,7 +87,7 @@ class ListDialogs(ToolArgs):
     """
 
     query: str | None = Field(None, description="Case-insensitive substring of the dialog name or @username")
-    types: list[DialogType] | None = Field(None, description="Only return dialogs of these types, e.g. [\"user\"]")
+    types: list[DialogType] | None = Field(None, description='Only return dialogs of these types, e.g. ["user"]')
     unread: bool = False
     archived: bool = False
     ignore_pinned: bool = False
@@ -141,7 +143,7 @@ async def list_dialogs(
                 )
             )
 
-    return [TextContent(type="text", text="\n".join(lines) or "No dialogs found")]
+    return [TextContent(type="text", text="\n".join(lines) or json_line({"count": 0}))]
 
 
 ### ListMessages ###
@@ -157,16 +159,21 @@ class ListMessages(ToolArgs):
     Use GetMessages to fetch a `reply_to` target that is not in the listed page.
 
     To page back through history, pass the id from the last line `{"next_offset_id": N}` as
-    `offset_id`, or use `offset_date` to start from a given date. If `unread` is set, only unread
-    messages are listed, up to `limit`.
+    `offset_id`. `from_date` and `to_date` limit the listing to a period. To read the conversation
+    around a message (e.g. a search hit), pass its id as `around_id`: the message itself and up to
+    `context` messages before and after it are returned. If `unread` is set, only unread messages
+    are listed, up to `limit`. An empty result is `{"count": 0}`.
     """
 
     dialog_id: int
     unread: bool = False
     limit: int = Field(100, description="Maximum number of messages to return")
     offset_id: int | None = Field(None, description="Only return messages older than this message id")
-    offset_date: str | None = Field(None, description="Only return messages older than this date, ISO 8601")
+    from_date: str | None = Field(None, description="Only return messages sent at or after this date, ISO 8601")
+    to_date: str | None = Field(None, description="Only return messages sent before this date, ISO 8601")
     search: str | None = Field(None, description="Only return messages containing this text")
+    around_id: int | None = Field(None, description="Return the messages around this message id instead of a page")
+    context: int = Field(5, description="With around_id, how many messages to return on each side")
 
 
 @tool_runner.register
@@ -187,12 +194,17 @@ async def list_messages(
 
         dialog = result.dialogs[-1]
 
+        if args.around_id is not None:
+            lines = [json_line(message_record(m)) for m in await messages_around(client, args)]
+            return [TextContent(type="text", text="\n".join(lines) or json_line({"count": 0}))]
+
+        from_date = parse_date(args.from_date)
         iter_messages_args: dict[str, t.Any] = {
             "entity": args.dialog_id,
             "reverse": False,
             "limit": min(dialog.unread_count, args.limit) if args.unread else args.limit,
             "offset_id": args.offset_id or 0,
-            "offset_date": datetime.fromisoformat(args.offset_date) if args.offset_date else None,
+            "offset_date": parse_date(args.to_date),
             "search": args.search,
         }
 
@@ -200,6 +212,8 @@ async def list_messages(
         last_id = None
         count = 0
         async for message in client.iter_messages(**iter_messages_args):
+            if from_date and message.date < from_date:
+                break
             count += 1
             last_id = message.id
             if not isinstance(message, custom.Message) or message.action:
@@ -210,7 +224,120 @@ async def list_messages(
         if last_id is not None and count == iter_messages_args["limit"]:
             lines.append(json_line({"next_offset_id": last_id}))
 
-    return [TextContent(type="text", text="\n".join(lines) or "No messages found")]
+    return [TextContent(type="text", text="\n".join(lines) or json_line({"count": 0}))]
+
+
+async def messages_around(client: TelegramClient, args: ListMessages) -> list[custom.Message]:
+    # Message ids of private chats are shared across all of them, so neighbours
+    # cannot be computed as around_id ± N and have to be fetched from the dialog.
+    newer = [
+        m async for m in client.iter_messages(args.dialog_id, min_id=args.around_id, limit=args.context, reverse=True)
+    ]
+    target = await client.get_messages(args.dialog_id, ids=args.around_id)
+    older = [m async for m in client.iter_messages(args.dialog_id, offset_id=args.around_id, limit=args.context)]
+    return [m for m in [*reversed(newer), target, *older] if isinstance(m, custom.Message) and not m.action]
+
+
+### SearchMessages ###
+
+
+class SearchMessages(ToolArgs):
+    """
+    Search messages by text across all dialogs at once, newest first.
+
+    Returns one JSON object per line in the ListMessages format plus `chat_id` and `chat`
+    (the dialog name). Read the conversation around a hit with ListMessages and `around_id`.
+    If the last line is `{"more": true}`, there are more hits: narrow the query or the dates.
+    An empty result is `{"count": 0}`.
+    """
+
+    query: str = Field(description="Text to search for")
+    limit: int = Field(50, description="Maximum number of messages to return")
+    from_date: str | None = Field(None, description="Only return messages sent at or after this date, ISO 8601")
+    to_date: str | None = Field(None, description="Only return messages sent before this date, ISO 8601")
+
+
+@tool_runner.register
+async def search_messages(
+    args: SearchMessages,
+) -> t.Sequence[TextContent | ImageContent | EmbeddedResource]:
+    client: TelegramClient
+    logger.info("method[SearchMessages] args[%s]", args)
+
+    from_date = parse_date(args.from_date)
+    lines: list[str] = []
+    count = 0
+    async with create_client() as client:
+        # entity=None makes Telethon use messages.searchGlobal
+        async for message in client.iter_messages(
+            None, search=args.query, limit=args.limit, offset_date=parse_date(args.to_date)
+        ):
+            if from_date and message.date < from_date:
+                break
+            count += 1
+            if not isinstance(message, custom.Message) or message.action:
+                continue
+            record = {"chat_id": message.chat_id, "chat": display_name(message.chat), **message_record(message)}
+            lines.append(json_line(record))
+    if count == args.limit:
+        lines.append(json_line({"more": True}))
+
+    return [TextContent(type="text", text="\n".join(lines) or json_line({"count": 0}))]
+
+
+### DownloadMedia ###
+
+
+class DownloadMedia(ToolArgs):
+    """
+    Download the file, photo or other media of a message to the local download folder.
+
+    Returns `{"path", "name", "size"}`; open the file from `path`. Files larger than
+    `max_size_mb` are refused, raise it explicitly for a big file.
+    """
+
+    dialog_id: int
+    message_id: int
+    max_size_mb: int = Field(50, description="Refuse files larger than this many megabytes")
+
+
+def download_dir() -> Path:
+    path = Path(os.environ.get("TELEGRAM_DOWNLOAD_DIR", Path.home() / "Claude" / "Telegram")).expanduser()
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def safe_file_name(name: str | None) -> str | None:
+    # The name comes from the sender, so keep only a plain file name inside the download folder.
+    name = Path((name or "").replace("\\", "/")).name.lstrip(".").strip()
+    return name or None
+
+
+@tool_runner.register
+async def download_media(
+    args: DownloadMedia,
+) -> t.Sequence[TextContent | ImageContent | EmbeddedResource]:
+    client: TelegramClient
+    logger.info("method[DownloadMedia] args[%s]", args)
+
+    async with create_client() as client:
+        message = await client.get_messages(args.dialog_id, ids=args.message_id)
+        if not isinstance(message, custom.Message) or not message.media or not message.file:
+            raise ValueError(f"Message {args.message_id} has no downloadable media")
+        if isinstance(message.media, types.MessageMediaWebPage):
+            raise ValueError(f"Message {args.message_id} only has a link preview")
+
+        size = message.file.size or 0
+        if size > args.max_size_mb * 1024 * 1024:
+            raise ValueError(f"File is {human_size(size)}, larger than max_size_mb={args.max_size_mb}")
+
+        name = safe_file_name(message.file.name)
+        prefix = f"{abs(args.dialog_id)}_{args.message_id}"
+        # Without a name Telethon appends the right extension to the path itself.
+        target = download_dir() / (f"{prefix}_{name}" if name else prefix)
+        path = await client.download_media(message, file=str(target))
+
+    return [TextContent(type="text", text=json_line({"path": path, "name": name, "size": human_size(size)}))]
 
 
 ### GetMessages ###
@@ -250,6 +377,13 @@ async def get_messages(
             lines.append(json_line(message_record(message) if message else {"id": message_id, "missing": True}))
 
     return [TextContent(type="text", text="\n".join(lines))]
+
+
+def parse_date(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    date = datetime.fromisoformat(value)
+    return date if date.tzinfo else date.astimezone()  # naive dates are local time
 
 
 def json_line(record: dict[str, t.Any]) -> str:
